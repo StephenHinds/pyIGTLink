@@ -9,6 +9,7 @@ install:
 - pip install coveralls
 - pip install -r requirements.txt
 script:
+- export PYTHONPATH=$PYTHONPATH:pyIGTLink
 - flake8
 - coverage run --source=pyIGTLink tests/tests.py
 after_success:
