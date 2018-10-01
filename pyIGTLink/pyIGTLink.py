@@ -15,6 +15,8 @@ import sys
 import struct
 import threading
 import time
+import select
+
 
 if sys.version_info >= (3, 0):
     import socketserver as SocketServer
@@ -22,7 +24,22 @@ else:
     import SocketServer
 
 IGTL_HEADER_VERSION = 1
+IGTL_HEADER_VERSION_2 = 2
 IGTL_IMAGE_HEADER_VERSION = 1
+IGTL_HEADER_SIZE = 58
+
+# 0   2                       14                                      34             42               50              58
+# +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+# | V |          TYPE         |              DEVICE_NAME              |   TIME_STAMP  |   BODY_SIZE   |     CRC64     |
+# +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+# 0          58            72
+# +----------+-------------+-------------------+-----------+
+# | HEADER   | EXT_HEADER  | CONTENT           | META_DATA |
+# +----------+-------------+-------------------+-----------+
+#            | < -----------------Body-------------------> |
+#
+#  CONTENT =  BODY_SIZE - (EXT_HEADER_SIZE + METADATA_SIZE)
 
 
 class PyIGTLink(SocketServer.TCPServer):
@@ -55,6 +72,8 @@ class PyIGTLink(SocketServer.TCPServer):
         SocketServer.TCPServer.__init__(self, (host, port), TCPRequestHandler)
 
         self.message_queue = collections.deque(maxlen=buffer_size)
+        self.message_in_queue = collections.deque(maxlen=buffer_size)
+
         self.lock_server_thread = threading.Lock()
 
         self._connected = False
@@ -93,7 +112,7 @@ class PyIGTLink(SocketServer.TCPServer):
         else:
             if len(self.message_queue) > 0:
                 with self.lock_server_thread:
-                    self.message_queue = collections.clear()
+                    self.message_queue.clear()
         return True
 
     def _signal_handler(self, signum, stackframe):
@@ -137,8 +156,11 @@ class TCPRequestHandler(SocketServer.BaseRequestHandler):
     """
     def handle(self):
         self.server.update_connected_status(True)
+        CONNECTION_LIST = []
+        CONNECTION_LIST.append(self.request)
+
         while True:
-            # print(len(self.server.message_queue))
+            read_sockets, write_sockets, error_sockets = select.select(CONNECTION_LIST, [], [],0)
             if len(self.server.message_queue) > 0:
                 with self.server.lock_server_thread:
                     message = self.server.message_queue.popleft()
@@ -154,6 +176,77 @@ class TCPRequestHandler(SocketServer.BaseRequestHandler):
                 time.sleep(1/1000.0)
                 with self.server.lock_server_thread:
                     if self.server.shuttingdown:
+                        _print('shutting down')
+                        break
+            for sock in read_sockets:
+                if sock == self.request:
+                    try:
+                        _print("incoming data")
+
+                        reply = []
+                        len_count = 0
+
+                        while len_count < IGTL_HEADER_SIZE:
+                            reply.append(self.request.recv(IGTL_HEADER_SIZE - len_count))
+                            len_count += len(reply[-1])
+                        reply = b''.join(reply)
+
+                        base_message = MessageBase()
+                        package = base_message.unpack(reply)
+                        data = None
+
+                        reply = []
+                        len_count = 0
+                        while len_count < package['data_len']:
+                            reply.append(self.request.recv(package['data_len'] - len_count))
+                            len_count += len(reply[-1])
+                        reply = b''.join(reply)
+
+                        if 'STRING' in package['type']:
+                            str_message = StringMessage(package)
+                            data, valid = str_message.unpack_body(reply)
+                            data['timestamp'] = package['timestamp']
+                            if not valid:
+                                data = None
+                            else:
+                                print(data['data'])
+
+                        if 'STATUS' in package['type']:
+                            status_message = StatusMessage()
+                            data, valid = status_message.unpack_body(reply)
+                            data['timestamp'] = package['timestamp']
+                            if not valid:
+                                data = None
+                            else:
+                                print(data['subcode'], data['code'], data['error_name'],data['message'])
+
+                        if 'TRANSFORM' in package['type']:
+                            tform_message = TransformMessage(np.eye(4))
+                            data, valid = tform_message.unpack_body(reply)
+                            data['timestamp'] = package['timestamp']
+                            if not valid:
+                                data = None
+                            else:
+                                print(data['data'])
+
+                        if 'IMAGE' in package['type']:
+                            image_message = ImageMessage(np.zeros((2, 2), dtype=np.uint8))
+                            data, valid = image_message.unpack_body(reply)
+                            data['timestamp'] = package['timestamp']
+                            if not valid:
+                                data = None
+                            else:
+                                print(data['data'])
+
+                        self.server.message_in_queue.append(data)
+                    except Exception as e:
+                        _print(str(e))
+                else:
+                    _print("new connection?")
+                    try:
+                        break
+                    except:
+                        _print("broken connection")
                         break
 
 
@@ -185,6 +278,62 @@ class MessageBase(object):
         self._binary_head = None
         self._body_pack_size = 0
 
+        if self._version == 2:
+            self._binary_extended_header = None
+            self._extended_header = None
+            # extended_header_size, meta_data_header_size, meta_data_size, message_id
+            self._metadata = None
+            self._metadata_header = None
+            self._metadata_header_size = 0
+            self._extended_header_size = 0
+            self._metadata_size = 0
+            self._metadata_message_id = 0
+            self._message_id = None
+            self._reserved = 0
+            # self._metadata_map = None
+            self._content = None
+            self._index_count = 0
+
+            # temporary
+            self._key_size = 0
+            self._value_encoding = 0
+            self._value_size = 0
+            self._key = ""
+            self._value = "="
+            self._metadata_map = []
+
+    def pack_extended_header(self):
+        binary_message = struct.pack(self._endian+"H", self._extended_header_size)
+        binary_message += binary_message + struct.pack(self._endian+"H", self._metadata_size)
+        binary_message += binary_message + struct.pack(self._endian + "I", self._message_id)
+        binary_message += binary_message + struct.pack(self._endian + "I", self._reserved)
+
+        self._binary_extended_header = binary_message
+
+    def unpack_extended_header(self, message):
+        (self._extended_header_size, self._metadata_size, self._message_id, self._reserved) \
+        = struct.unpack(">HII", message)
+
+    def pack_metadata(self):
+        '''
+        # Metadata header:
+        # pack index count
+        # for each index: pack the lengths: key size, value encoding
+        binary_message = struct.pack(self._endian+"H", self._index_count)
+
+        for
+        binary_message += binary_message + struct.pack(self._endian+"H", self._metadata_size)
+
+
+        # Metadata body:
+        # pack the key and pack the value
+        binary_message = struct.pack(self._endian+"H", self._extended_header_size)
+        binary_message = struct.pack()
+        '''
+
+    def unpack_metadata(self, message):
+        self._index_count = struct.unpack(">H", message)
+
     def pack(self):
         binary_body = self.get_binary_body()
         body_size = self.get_body_pack_size()
@@ -199,6 +348,29 @@ class MessageBase(object):
         binary_message = binary_message + struct.pack(self._endian+"Q", crc)
 
         self._binary_head = binary_message
+
+    def unpack(self, message):
+        s = struct.Struct('> H 12s 20s II Q Q')  # big-endian
+        values = s.unpack(message)
+        self._version = values[0]
+        self._name = str(values[1], 'utf-8').rstrip('\0')
+        self._device_name = str(values[2], 'utf-8').rstrip('\0')
+
+        seconds = float(values[3])
+        frac_of_second = values[4]
+        nanoseconds = float(_igtl_frac_to_nanosec(frac_of_second))
+
+        timestamp = seconds + (nanoseconds * 1e-9)
+
+        self._body_size = values[5]
+
+        valid = False
+
+        return {'type': self._name,
+                'device_name': self._device_name,
+                'timestamp': self._timestamp,
+                'valid': valid,
+                'data_len': self._body_size}
 
     def get_binary_message(self):
         if not self._binary_head:
@@ -218,6 +390,153 @@ class MessageBase(object):
 
     def get_body_pack_size(self):
         return self._body_pack_size
+
+
+class CommandMessage(MessageBase):
+    def __init__(self, command, command_id, command_name, encoding, timestamp=None, device_name='', ):
+        MessageBase.__init__(self)
+        self._valid_message = True
+        self._name = "STATUS"
+        self._device_name = device_name
+        if timestamp:
+            self._timestamp = timestamp
+        self._command_id = command_id
+        self._command_name = command_name
+        self._encoding = encoding
+        self.command = command
+
+
+    def pack_body(self):
+        # COMMAND_ID as uint32 (The unique ID of this command)
+        binary_message = struct.pack(self._endian + "I", self._command_id)
+
+        # COMMAND_NAME as uint8[IGT_COMMAND_SIZE] (The name of the command)
+        binary_message += struct.pack(self._endian + "B", self._command_name)
+
+        # ENCODING as uint16 (Character encoding type as MIBenum)
+        binary_message += struct.pack(self._endian + "H", self._encoding)
+
+        self._body_pack_size = len(binary_message)
+
+        self._binary_body = binary_message
+
+    def unpack_body(self, message):
+        (self._command_id, self._command_name, self._encoding, self._message) \
+            = struct.unpack(">Hq20s%ds" % (len(message) - 30), message)
+        self._error_name = str(self._error_name, 'ascii')
+        self._message = str(self._message, 'ascii')
+        valid = True
+        return {'type': 'String',
+                'code': self._code,
+                'subcode': self._sub_code,
+                'error_name': self._error_name,
+                'message': self._message}, True
+
+
+class StatusMessage(MessageBase):
+    __maxCharLength_ERROR_NAME = 20
+    __length_STATUS_MESSAGE = None
+
+    _messageCode = (['Invalid packet - 0 is not used', \
+                     'OK (Default status)', \
+                     'Unknown error', \
+                     'Panic mode (emergency)', \
+                     'Not found (file, configuration, device etc)', \
+                     'Access denied', \
+                     'Busy', \
+                     'Time out - Connection lost', \
+                     'Overflow - Can\'t be reached', \
+                     'Checksum error', \
+                     'Configuration error', \
+                     'Not enough resource (memory, storage etc)', \
+                     'Illegal/Unknown instruction (or feature not implemented / Unknown command received)', \
+                     'Device not ready (starting up)', \
+                     'Manual mode (device does not accept commands)', \
+                     'Device disabled', \
+                     'Device not present', \
+                     'Device version not known', \
+                     'Hardware failure', \
+                     'Exiting / shut down in progress'])
+
+    def __init__(self, code = 1, sub_code = 0, error_name ='OK', message = '', timestamp=None, device_name = '', ):
+        MessageBase.__init__(self)
+        self._valid_message = True
+        self._name = "STATUS"
+        self._device_name = device_name
+        if timestamp:
+            self._timestamp = timestamp
+        self._code = code
+        self._sub_code = sub_code
+        self._error_name = error_name
+        self._message = message
+
+    def pack_body(self):
+        # CODE as uint16 (Status code groups: 1-Ok, 2-Generic Error, ... (see below))
+        binary_message = struct.pack(self._endian + "H", self._code)
+
+        # SUB_CODE as int64 (Sub-code for the error (ex. 0x200 - file not found))
+        binary_message += struct.pack(self._endian + "Q", self._sub_code)
+
+        # ERROR_NAME as char[20] ("Error", "OK", "Warning" - can be anything, don't relay on this)
+        self._error_name = bytes(self._error_name, 'ascii')
+        binary_message += struct.pack(self._endian + "20s", self._error_name)
+
+        # MESSAGE as char[BODY_SIZE-30] (Optional (English) description (ex. "File C:\test.ini not found"))
+        self._message = bytes(self._message, 'ascii')
+        binary_message += struct.pack(self._endian + "%ds" % len(self._message), self._message)
+
+        self._body_pack_size = len(binary_message)
+
+        self._binary_body = binary_message
+
+    def unpack_body(self, message):
+        (self._code, self._sub_code, self._error_name, self._message) \
+            = struct.unpack(">Hq20s%ds" % (len(message) - 30), message)
+        self._error_name = str(self._error_name, 'ascii')
+        self._message = str(self._message, 'ascii')
+        valid = True
+        return {'type': 'String',
+                'code': self._code,
+                'subcode': self._sub_code,
+                'error_name': self._error_name,
+                'message': self._message}, True
+
+
+class StringMessage(MessageBase):
+    def __init__(self, message='', timestamp=None, device_name=''):
+        MessageBase.__init__(self)
+        self._valid_message = True
+        self._name = "STRING"
+        self._device_name = device_name
+        if timestamp:
+            self._timestamp = timestamp
+
+        self._encoding = 3  # ASCII
+        self._length = len(message)
+        self._string = message
+
+    def pack_body(self):
+        # ENCODING as uint16 (Character encoding type as MIBenum value. Default=3)
+        binary_message = struct.pack(self._endian+"H", self._encoding)
+
+        # LENGTH as uint16 (Length of string (bytes))
+        binary_message += struct.pack(self._endian + "H", self._length)
+
+        # STRING as uint8 (Byte array of the string)
+        self._string= bytes(self._string, 'ascii')  # Or other appropriate encoding
+        binary_message += struct.pack(self._endian + "%ds" % len(self._string), self._string)
+
+        self._body_pack_size = len(binary_message)
+
+        self._binary_body = binary_message
+
+    def unpack_body(self, message):
+        (self._encoding, self._length, self._string) = struct.unpack(">HH%ds" % (len(message) - 4), message)
+        self._string = str(self._string, 'ascii')
+        print(self._string)
+        valid = True
+        return {'type': 'String',
+                'data': self._string}, True
 
 
 # http://openigtlink.org/protocols/v2_image.html
@@ -348,6 +667,33 @@ class ImageMessage(MessageBase):
 
         self._binary_body = binary_message
 
+    def unpack_body(self, message):
+        header_portion_len = 12 + (12 * 4) + 12
+
+        s_head = \
+            struct.Struct('> H B B B B H H H f f f f f f f f f f f f H H H H H H')
+        values_header = s_head.unpack(message[:header_portion_len])
+
+        endian = values_header[3]
+        size_x = values_header[23]
+        size_y = values_header[24]
+        size_z = values_header[25]
+        if endian == 2:
+            endian = '<'
+        else:
+            endian = '>'
+
+        values_img = message[header_portion_len:]
+
+        dt = np.dtype(np.uint8)
+        dt = dt.newbyteorder(endian)
+        data = np.frombuffer(values_img, dtype=dt)
+
+        data = np.squeeze(np.reshape(data, [size_y, size_x, size_z]))
+
+        return {'type': 'IMAGE',
+                'data': data}, True
+
 
 class TransformMessage(MessageBase):
     def __init__(self, tform, timestamp=None, device_name=''):
@@ -434,6 +780,19 @@ class TransformMessage(MessageBase):
 
         self._binary_body = binary_message
 
+    def unpack_body(self, message):
+        s = struct.Struct('> f f f f f f f f f f f f')
+        values = s.unpack(message)
+        self._matrix = np.asarray([[values[0], values[3], values[6], values[9]],
+                                   [values[1], values[4], values[7], values[10]],
+                                   [values[2], values[5], values[8], values[11]],
+                                   [0, 0, 0, 1]])
+
+        valid = True
+
+        return {'type': 'TRANSFORM',
+                'data': self._matrix}, valid
+
 
 class ImageMessageMatlab(ImageMessage):
     def __init__(self, image, dim, spacing=[1, 1, 1], timestamp=None):
@@ -472,6 +831,19 @@ def _igtl_nanosec_to_frac(nanosec):
         mask >>= 1
     return r
 
+# https://github.com/openigtlink/OpenIGTLink/blob/cf9619e2fece63be0d30d039f57b1eb4d43b1a75/Source/igtlutil/igtl_util.c#L193
+def _igtl_frac_to_nanosec(frac):
+    base = 1000000000 # 10^9
+    mask = 0x80000000
+    r = 0x00000000
+    while mask:
+        base += 1
+        base >>= 1
+        r += base if (frac & mask) else 0
+        mask >>= 1
+    return r
+
+
 
 if __name__ == "__main__":
     """
@@ -498,7 +870,10 @@ if __name__ == "__main__":
                 transform_message = TransformMessage(np.eye(4).astype(dtype=np.float32))
                 server.add_message_to_send_queue(image_message)
                 server.add_message_to_send_queue(transform_message)
+                string_message = StringMessage("hello")
+                server.add_message_to_send_queue(string_message)
             time.sleep(0.1)
+            print(server.is_connected())
 
     elif len(sys.argv) == 2:
         print("\n\n   Run as server, sending moving circle \n\n  ")
